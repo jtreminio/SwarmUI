@@ -145,11 +145,8 @@ public static class Utilities
     /// <summary>URL to where the documentation files start.</summary>
     public const string RepoDocsRoot = $"{RepoRoot}/blob/master/docs/";
 
-    /// <summary>Current git commit (if known -- empty if unknown).</summary>
-    public static string GitCommit = "";
-
     /// <summary>Used by linked pages to prevent cache errors when data changes.</summary>
-    public static string VaryID = Version;
+    public static string VaryID = $"{Version}.RUN-{Guid.NewGuid():N}";
 
     /// <summary>A temporary unique ID for this server, used to make sure we don't ever form a circular swarm connection path.</summary>
     public static Guid LoopPreventionID = Guid.NewGuid();
@@ -169,11 +166,6 @@ public static class Utilities
 
     static Utilities()
     {
-        if (File.Exists("./.git/refs/heads/master"))
-        {
-            GitCommit = File.ReadAllText("./.git/refs/heads/master").Trim()[0..8];
-            VaryID += ".GIT-" + GitCommit;
-        }
         for (int i = 0; i <= 9; i++)
         {
             ReservedFilenames.Add($"com{i}");

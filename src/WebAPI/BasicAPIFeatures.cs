@@ -38,6 +38,7 @@ public static class BasicAPIFeatures
         API.RegisterAPICall(DuplicatePreset, true, Permissions.ManagePresets);
         API.RegisterAPICall(DeletePreset, true, Permissions.ManagePresets);
         API.RegisterAPICall(GetCurrentStatus, false, Permissions.FundamentalGenerateTabAccess);
+        API.RegisterAPICall(SkipGeneration, true, Permissions.BasicImageGeneration);
         API.RegisterAPICall(InterruptAll, true, Permissions.BasicImageGeneration);
         API.RegisterAPICall(GetUserSettings, false, Permissions.ReadUserSettings);
         API.RegisterAPICall(ChangeUserSettings, true, Permissions.EditUserSettings);
@@ -588,6 +589,49 @@ public static class BasicAPIFeatures
     public static async Task<JObject> GetCurrentStatus(Session session)
     {
         return GetCurrentStatusRaw(session);
+    }
+
+    [API.APIDescription("Skip one currently generating item without cancelling queued items.",
+        """
+            "success": true,
+            "skipped": true,
+            "generation_id": "1234",
+            "request_id": "1001",
+            "batch_index": "0"
+        """)]
+    public static async Task<JObject> SkipGeneration(Session session,
+        [API.APIParameter("Specific generation ID to skip, or empty to skip the oldest active generation in this session.")] string generation_id = null,
+        [API.APIParameter("Forwarded generation ID used by a connected Swarm instance.")] string client_generation_id = null)
+    {
+        Session.GenerationTask task = null;
+        if (!string.IsNullOrWhiteSpace(generation_id))
+        {
+            if (long.TryParse(generation_id, out long generationID))
+            {
+                session.GenerationTasks.TryGetValue(generationID, out task);
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(client_generation_id))
+        {
+            task = session.GenerationTasks.Values.Where(t => t.ClientGenerationID == client_generation_id).MinBy(t => t.ID);
+        }
+        else
+        {
+            task = session.GenerationTasks.Values.Where(t => t.IsLive).MinBy(t => t.ID);
+        }
+        bool skipped = task is not null && task.TrySkip();
+        if (skipped)
+        {
+            Logs.Debug($"User '{session.User.UserID}' skipped generation task #{task.ID}.");
+        }
+        return new JObject()
+        {
+            ["success"] = true,
+            ["skipped"] = skipped,
+            ["generation_id"] = task is null ? null : $"{task.ID}",
+            ["request_id"] = task is null ? null : $"{task.RequestID}",
+            ["batch_index"] = task?.BatchIndex
+        };
     }
 
     [API.APIDescription("Tell all waiting generations in this session or all sessions to interrupt.",

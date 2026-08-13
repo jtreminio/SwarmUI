@@ -143,6 +143,9 @@ public class T2IParamInput
     /// <summary>Interrupt token from the session.</summary>
     public CancellationToken InterruptToken;
 
+    /// <summary>Optional task tracker for interrupting only this generation.</summary>
+    public Session.GenerationTask GenerationTask;
+
     /// <summary>List of reasons this input did not match backend requests, if any.</summary>
     public HashSet<string> RefusalReasons = [];
 

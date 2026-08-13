@@ -530,15 +530,68 @@ public class SwarmSwarmBackend : AbstractT2IBackend
         {
             req[T2IParamTypes.ForwardRawBackendData.Type.ID] = true;
         }
+        if (user_input.GenerationTask is not null)
+        {
+            req["client_generation_id"] = $"{user_input.GenerationTask.ID}";
+        }
         req[T2IParamTypes.ForwardSwarmData.Type.ID] = true;
         return req;
+    }
+
+    /// <summary>Forwards a generation interruption to the remote Swarm instance.</summary>
+    public async Task SendGenerationInterrupt(T2IParamInput user_input, CancellationToken stop)
+    {
+        try
+        {
+            if (!(user_input.GenerationTask?.SkipRequested ?? false))
+            {
+                await HttpClient.PostJson($"{Address}/API/InterruptAll", new() { ["session_id"] = Session, ["other_sessions"] = false }, RequestAdapter());
+                return;
+            }
+            while (!stop.IsCancellationRequested)
+            {
+                JObject response = await HttpClient.PostJson($"{Address}/API/SkipGeneration", new() { ["session_id"] = Session, ["client_generation_id"] = $"{user_input.GenerationTask.ID}" }, RequestAdapter());
+                AutoThrowException(response);
+                if (response.Value<bool>("skipped"))
+                {
+                    return;
+                }
+                await Task.Delay(100, stop);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"Remote Swarm does not support targeted generation skipping: {ex.Message}");
+        }
     }
 
     /// <inheritdoc/>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         user_input.ProcessPromptEmbeds(x => $"<embedding:{x}>");
-        JObject generated = SendAPIJSON("GenerateText2Image", BuildRequest(user_input)).Result;
+        Task<JObject> generationTask = SendAPIJSON("GenerateText2Image", BuildRequest(user_input));
+        using CancellationTokenSource stopInterrupt = new();
+        Task interruptSignal = Task.Delay(TimeSpan.FromHours(72), user_input.InterruptToken);
+        if (await Task.WhenAny(generationTask, interruptSignal) == interruptSignal)
+        {
+            _ = SendGenerationInterrupt(user_input, stopInterrupt.Token);
+        }
+        JObject generated;
+        try
+        {
+            generated = await generationTask;
+        }
+        finally
+        {
+            stopInterrupt.Cancel();
+        }
+        if (user_input.InterruptToken.IsCancellationRequested)
+        {
+            return [];
+        }
         Image[] images = [.. generated["images"].Select(img => ImageFile.FromDataString(img.ToString()) as Image)];
         return images;
     }
@@ -580,72 +633,89 @@ public class SwarmSwarmBackend : AbstractT2IBackend
             });
             await websocket.SendJson(BuildRequest(user_input), API.WebsocketTimeout);
             Logs.Debug($"[{HandlerTypeData.Name}] WebSocket connected, remote backend {LinkedRemoteBackendID} should begin generating...");
-            while (true)
+            using CancellationTokenSource stopInterrupt = new();
+            Task interruptRequest = null;
+            try
             {
-                if (user_input.InterruptToken.IsCancellationRequested)
+                while (true)
                 {
-                    // TODO: This will require separate remote sessions per-user for multiuser support
-                    await HttpClient.PostJson($"{Address}/API/InterruptAll", new() { ["session_id"] = Session, ["other_sessions"] = false }, RequestAdapter());
-                }
-                JObject response = await websocket.ReceiveJson(Utilities.ExtraLargeMaxReceive, true);
-                if (response is not null)
-                {
-                    AutoThrowException(response);
-                    if (response.TryGetValue("gen_progress", out JToken val) && val is JObject objVal)
+                    Task<JObject> receiveTask = websocket.ReceiveJson(Utilities.ExtraLargeMaxReceive, true);
+                    if (interruptRequest is null)
                     {
-                        if (objVal.ContainsKey("preview"))
+                        using CancellationTokenSource receiveCanceller = new();
+                        using CancellationTokenSource linkedInterrupt = CancellationTokenSource.CreateLinkedTokenSource(user_input.InterruptToken, receiveCanceller.Token);
+                        Task interruptTask = Task.Delay(TimeSpan.FromHours(72), linkedInterrupt.Token);
+                        Task firstTask = await Task.WhenAny(receiveTask, interruptTask);
+                        receiveCanceller.Cancel();
+                        if (firstTask == interruptTask && user_input.InterruptToken.IsCancellationRequested)
                         {
-                            Logs.Verbose($"[{HandlerTypeData.Name}] Got progress image from websocket {batchId}");
+                            interruptRequest = SendGenerationInterrupt(user_input, stopInterrupt.Token);
+                        }
+                    }
+                    JObject response = await receiveTask;
+                    if (response is not null)
+                    {
+                        AutoThrowException(response);
+                        if (response.TryGetValue("gen_progress", out JToken val) && val is JObject objVal)
+                        {
+                            if (objVal.ContainsKey("preview"))
+                            {
+                                Logs.Verbose($"[{HandlerTypeData.Name}] Got progress image from websocket {batchId}");
+                            }
+                            else
+                            {
+                                Logs.Verbose($"[{HandlerTypeData.Name}] Got progress from websocket for {batchId}: {response.ToDenseDebugString(true)}");
+                            }
+                            string actualId = batchId;
+                            if (objVal.TryGetValue("batch_index", out JToken batchIndRemote) && int.TryParse($"{batchIndRemote}", out int batchIndRemoteParsed) && batchIndRemoteParsed > 0 && int.TryParse(batchId, out int localInd))
+                            {
+                                actualId = $"{localInd + batchIndRemoteParsed}";
+                            }
+                            objVal["batch_index"] = actualId;
+                            objVal["request_id"] = $"{user_input.UserRequestId}";
+                            takeOutput(objVal);
+                        }
+                        else if (response.TryGetValue("image", out val))
+                        {
+                            Logs.Verbose($"[{HandlerTypeData.Name}] Got image from websocket");
+                            takeOutput(ImageFile.FromDataString(val.ToString()));
+                        }
+                        else if (response.TryGetValue("raw_backend_data", out JToken rawData))
+                        {
+                            string type = rawData["type"].ToString();
+                            string datab64 = rawData["data"].ToString();
+                            byte[] data = Convert.FromBase64String(datab64);
+                            user_input.ReceiveRawBackendData?.Invoke(type, data);
+                        }
+                        else if (response.TryGetValue("raw_swarm_data", out JToken rawSwarmDataTok) && rawSwarmDataTok is JObject rawSwarmData)
+                        {
+                            Logs.Verbose($"Got raw spawn data from websocket: {rawSwarmData.ToDenseDebugString(true)}");
+                            if (rawSwarmData.TryGetValue("params_used", out JToken paramsUsed))
+                            {
+                                foreach (JToken paramUsed in paramsUsed)
+                                {
+                                    user_input.ParamsQueried.Add($"{paramUsed}");
+                                }
+                            }
+                            if (user_input.Get(T2IParamTypes.ForwardSwarmData, false))
+                            {
+                                takeOutput(response);
+                            }
                         }
                         else
                         {
-                            Logs.Verbose($"[{HandlerTypeData.Name}] Got progress from websocket for {batchId}: {response.ToDenseDebugString(true)}");
-                        }
-                        string actualId = batchId;
-                        if (objVal.TryGetValue("batch_index", out JToken batchIndRemote) && int.TryParse($"{batchIndRemote}", out int batchIndRemoteParsed) && batchIndRemoteParsed > 0 && int.TryParse(batchId, out int localInd))
-                        {
-                            actualId = $"{localInd + batchIndRemoteParsed}";
-                        }
-                        objVal["batch_index"] = actualId;
-                        objVal["request_id"] = $"{user_input.UserRequestId}";
-                        takeOutput(objVal);
-                    }
-                    else if (response.TryGetValue("image", out val))
-                    {
-                        Logs.Verbose($"[{HandlerTypeData.Name}] Got image from websocket");
-                        takeOutput(ImageFile.FromDataString(val.ToString()));
-                    }
-                    else if (response.TryGetValue("raw_backend_data", out JToken rawData))
-                    {
-                        string type = rawData["type"].ToString();
-                        string datab64 = rawData["data"].ToString();
-                        byte[] data = Convert.FromBase64String(datab64);
-                        user_input.ReceiveRawBackendData?.Invoke(type, data);
-                    }
-                    else if (response.TryGetValue("raw_swarm_data", out JToken rawSwarmDataTok) && rawSwarmDataTok is JObject rawSwarmData)
-                    {
-                        Logs.Verbose($"Got raw spawn data from websocket: {rawSwarmData.ToDenseDebugString(true)}");
-                        if (rawSwarmData.TryGetValue("params_used", out JToken paramsUsed))
-                        {
-                            foreach (JToken paramUsed in paramsUsed)
-                            {
-                                user_input.ParamsQueried.Add($"{paramUsed}");
-                            }
-                        }
-                        if (user_input.Get(T2IParamTypes.ForwardSwarmData, false))
-                        {
-                            takeOutput(response);
+                            Logs.Verbose($"[{HandlerTypeData.Name}] Got other from websocket: {response.ToDenseDebugString(true)}");
                         }
                     }
-                    else
+                    if (websocket.CloseStatus.HasValue)
                     {
-                        Logs.Verbose($"[{HandlerTypeData.Name}] Got other from websocket: {response.ToDenseDebugString(true)}");
+                        break;
                     }
                 }
-                if (websocket.CloseStatus.HasValue)
-                {
-                    break;
-                }
+            }
+            finally
+            {
+                stopInterrupt.Cancel();
             }
             await websocket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, Program.GlobalProgramCancel);
         });

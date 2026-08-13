@@ -21,6 +21,18 @@ function doInterrupt(allSessions = false) {
         toggleGenerateForever();
     }
 }
+
+/** Skips one active generation without cancelling its queue. */
+function skipGeneration(generationId, callback = null) {
+    let request = {};
+    if (generationId) {
+        request.generation_id = generationId;
+    }
+    genericRequest('SkipGeneration', request, data => {
+        updateGenCount();
+        callback?.(data);
+    });
+}
 let genForeverInterval, genPreviewsInterval;
 
 let lastGenForeverParams = null;

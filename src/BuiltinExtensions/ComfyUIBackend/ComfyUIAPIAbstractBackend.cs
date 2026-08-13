@@ -328,7 +328,7 @@ public abstract class ComfyUIAPIAbstractBackend : AbstractT2IBackend
             {
                 Logs.Verbose($"Will use workflow: {JObject.Parse(workflow).ToDenseDebugString()}");
             }
-            JObject promptResult = await HttpClient.PostJSONString($"{APIAddress}/prompt", workflow, interrupt);
+            JObject promptResult = await HttpClient.PostJSONString($"{APIAddress}/prompt", workflow, Program.GlobalProgramCancel);
             if (Logs.MinimumLevel <= Logs.LogLevel.Verbose)
             {
                 Logs.Verbose($"ComfyUI prompt said: {promptResult.ToDenseDebugString()}");
@@ -358,8 +358,33 @@ public abstract class ComfyUIAPIAbstractBackend : AbstractT2IBackend
             using CancellationTokenSource autoCanceller = new();
             using CancellationTokenSource interruptCanceller = CancellationTokenSource.CreateLinkedTokenSource(interrupt, autoCanceller.Token);
             Task interruptTask = Task.Delay(TimeSpan.FromHours(72), interruptCanceller.Token);
-            async Task doInterruptNow()
+            bool ignoreInterrupt = false;
+            async Task<bool> doInterruptNow()
             {
+                try
+                {
+                    using HttpResponseMessage cancelResponse = await HttpClient.PostAsync($"{APIAddress}/api/jobs/{Uri.EscapeDataString(promptId)}/cancel", null, Program.GlobalProgramCancel);
+                    if (cancelResponse.IsSuccessStatusCode)
+                    {
+                        hasDeletedQueueItem = true;
+                        hasInterrupted = true;
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (user_input.GenerationTask?.SkipRequested ?? false)
+                    {
+                        Logs.Warning($"ComfyUI targeted cancellation failed for prompt {promptId}; waiting for it to finish: {ex.Message}");
+                        return false;
+                    }
+                    Logs.Verbose($"ComfyUI targeted cancellation route failed, using legacy interruption: {ex.Message}");
+                }
+                if (user_input.GenerationTask?.SkipRequested ?? false)
+                {
+                    Logs.Warning($"ComfyUI backend does not support safe targeted cancellation for prompt {promptId}; waiting for it to finish.");
+                    return false;
+                }
                 if (!hasDeletedQueueItem)
                 {
                     hasDeletedQueueItem = true;
@@ -373,20 +398,30 @@ public abstract class ComfyUIAPIAbstractBackend : AbstractT2IBackend
                     await HttpClient.PostAsync($"{APIAddress}/interrupt", new StringContent(new JObject() { ["prompt_id"] = promptId }.ToString()), Program.GlobalProgramCancel);
                 }
                 await HttpClient.PostAsync($"{APIAddress}/history", new StringContent(new JObject() { ["delete"] = new JArray() { promptId } }.ToString()), Program.GlobalProgramCancel);
+                return true;
             }
             while (true)
             {
-                if (interrupt.IsCancellationRequested && !hasInterrupted)
+                if (interrupt.IsCancellationRequested && !hasInterrupted && !ignoreInterrupt)
                 {
-                    await doInterruptNow();
-                    return;
+                    if (await doInterruptNow())
+                    {
+                        return;
+                    }
+                    ignoreInterrupt = true;
                 }
                 Task<byte[]> getData = socket.ReceiveData(Utilities.ExtraLargeMaxReceive, Program.GlobalProgramCancel);
-                Task t = await Task.WhenAny(getData, interruptTask);
-                if (t == interruptTask)
+                if (!ignoreInterrupt)
                 {
-                    await doInterruptNow();
-                    return;
+                    Task t = await Task.WhenAny(getData, interruptTask);
+                    if (t == interruptTask)
+                    {
+                        if (await doInterruptNow())
+                        {
+                            return;
+                        }
+                        ignoreInterrupt = true;
+                    }
                 }
                 byte[] output = await getData;
                 if (output is not null)

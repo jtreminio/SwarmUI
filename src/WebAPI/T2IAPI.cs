@@ -206,7 +206,7 @@ public static class T2IAPI
         }
         foreach (string key in keys)
         {
-            if (key == "session_id" || key == "presets" || key == "extra_metadata")
+            if (key == "session_id" || key == "presets" || key == "extra_metadata" || key == "client_generation_id")
             {
                 // Skip
             }
@@ -255,6 +255,7 @@ public static class T2IAPI
     {
         (int images, JObject rawInput, SharedGenT2IData data, int batchOffset) = input;
         using Session.GenClaim claim = session.Claim(gens: images);
+        string clientGenerationID = rawInput.Value<string>("client_generation_id");
         if (isWS)
         {
             output(BasicAPIFeatures.GetCurrentStatusRaw(session));
@@ -370,7 +371,14 @@ public static class T2IAPI
             {
                 output(new JObject() { ["raw_swarm_data"] = new JObject() { ["params_used"] = JArray.FromObject(thisParams.ParamsQueried.ToArray()) } });
             }
-            output(new JObject() { ["image"] = url, ["batch_index"] = $"{actualIndex}", ["request_id"] = $"{thisParams.UserRequestId}", ["metadata"] = string.IsNullOrWhiteSpace(metadata) ? null : metadata });
+            output(new JObject()
+            {
+                ["image"] = url,
+                ["batch_index"] = $"{actualIndex}",
+                ["request_id"] = $"{thisParams.UserRequestId}",
+                ["generation_id"] = thisParams.GenerationTask is null ? null : $"{thisParams.GenerationTask.ID}",
+                ["metadata"] = string.IsNullOrWhiteSpace(metadata) ? null : metadata
+            });
         }
         for (int i = 0; i < images && !claim.ShouldCancel; i++)
         {
@@ -399,24 +407,33 @@ public static class T2IAPI
                 }
             }
             int numCalls = 0;
-            tasks.Add(Task.Run(() => T2IEngine.CreateImageTask(thisParams, $"{imageIndex}", claim, output, setError, isWS,
-                (image, metadata) =>
+            Session.GenerationTask generationTask = new(session, claim, thisParams.UserRequestId, $"{imageIndex}", clientGenerationID);
+            thisParams.GenerationTask = generationTask;
+            thisParams.InterruptToken = generationTask.InterruptToken;
+            tasks.Add(Task.Run(async () =>
+            {
+                using (generationTask)
                 {
-                    int actualIndex = imageIndex + numCalls;
-                    if (image.IsReal)
-                    {
-                        numCalls++;
-                        if (numCalls > batchSizeExpected)
+                    await T2IEngine.CreateImageTask(thisParams, $"{imageIndex}", claim, output, setError, isWS,
+                        (image, metadata) =>
                         {
-                            actualIndex = images * batchSizeExpected + Interlocked.Increment(ref data.NumExtra);
-                        }
-                    }
-                    else
-                    {
-                        actualIndex = -10 - Interlocked.Increment(ref data.NumNonReal);
-                    }
-                    saveImage(image, actualIndex, thisParams, metadata);
-                })));
+                            int actualIndex = imageIndex + numCalls;
+                            if (image.IsReal)
+                            {
+                                numCalls++;
+                                if (numCalls > batchSizeExpected)
+                                {
+                                    actualIndex = images * batchSizeExpected + Interlocked.Increment(ref data.NumExtra);
+                                }
+                            }
+                            else
+                            {
+                                actualIndex = -10 - Interlocked.Increment(ref data.NumNonReal);
+                            }
+                            saveImage(image, actualIndex, thisParams, metadata);
+                        });
+                }
+            }));
             if (Program.Backends.QueuedRequests < Program.ServerSettings.Backends.MaxRequestsForcedOrder)
             {
                 Task.Delay(20).Wait(); // Tiny few-ms delay to encourage tasks retaining order.

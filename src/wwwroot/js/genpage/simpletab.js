@@ -31,6 +31,7 @@ class SimpleTab {
         this.genHandler.validateModel = false;
         this.genHandler.imageContainerDivId = 'simple_image_container';
         this.genHandler.imageId = 'simple_image_container_img';
+        this.genHandler.skipButtonId = 'simple_skip_button';
         this.mustSelectTarget = null;
         this.histories = {};
     }
@@ -287,6 +288,11 @@ class SimpleTab {
         this.genHandler.doInterrupt();
     }
 
+    /** Skips the current Simple tab generation. */
+    doSkip() {
+        this.genHandler.doSkip();
+    }
+
     clearBatch() {
         this.batchArea.innerHTML = '';
         this.getHistoryFor(this.browser.selected).clear();
@@ -430,12 +436,14 @@ class SimpleTabGenerateHandler extends GenerateHandler {
         this.currentDisplayedRequestId = this.getRequestIdFor(batchId);
         simpleTab.markDoneLoading();
         simpleTab.setImage(src);
+        simpleTab.imageElem.dataset.batch_id = batchId;
     }
 
     gotImageResult(image, metadata, batchId) {
         this.currentDisplayedRequestId = this.getRequestIdFor(batchId);
         simpleTab.markDoneLoading();
         simpleTab.setImage(image);
+        simpleTab.imageElem.dataset.batch_id = batchId;
         let history = this.getHistoryFor(metadata);
         history.entries.filter(e => this.getRequestIdFor(e.batchId) == this.getRequestIdFor(batchId) && e.isLoading && e.div).forEach(e => e.div.remove());
         history.add(image, metadata, batchId, false);
@@ -445,6 +453,7 @@ class SimpleTabGenerateHandler extends GenerateHandler {
         this.currentDisplayedRequestId = this.getRequestIdFor(batchId);
         simpleTab.markDoneLoading();
         simpleTab.setImage(image);
+        simpleTab.imageElem.dataset.batch_id = batchId;
         if (existingDiv) {
             delete existingDiv.dataset.is_loading;
         }
@@ -462,6 +471,7 @@ class SimpleTabGenerateHandler extends GenerateHandler {
             return batch_div;
         }
         simpleTab.setImage(image);
+        simpleTab.imageElem.dataset.batch_id = batchId;
         return batch_div;
     }
 
@@ -469,6 +479,7 @@ class SimpleTabGenerateHandler extends GenerateHandler {
         if (this.isCurrentRequest(batchId)) {
             simpleTab.markLoading();
             simpleTab.setImage(image);
+            simpleTab.imageElem.dataset.batch_id = batchId;
         }
     }
 
@@ -479,10 +490,32 @@ class SimpleTabGenerateHandler extends GenerateHandler {
                 return;
             }
             simpleTab.markLoading();
+            simpleTab.imageElem.dataset.batch_id = batchId;
             simpleTab.progressWrapper.style.display = '';
             simpleTab.progressWrapper.querySelector('.image-preview-progress-current').style.width = `${current * 100}%`;
             simpleTab.progressWrapper.querySelector('.image-preview-progress-overall').style.width = `${overall * 100}%`;
         }
+    }
+
+    /** Cleans up Simple tab history after a generation is skipped. */
+    gotGenerationSkipped(skipped, img) {
+        simpleTab.markDoneLoading();
+        if (!img) {
+            return;
+        }
+        let history = this.getHistoryFor(img.metadata);
+        let batchId = `${skipped.request_id}_${skipped.batch_index}`;
+        if (getUserSetting('ui.removeinterruptedgens', false)) {
+            history.entries = history.entries.filter(e => e.batchId != batchId);
+            simpleTab.setNoImage();
+        }
+        else {
+            let entry = history.entries.find(e => e.batchId == batchId);
+            if (entry) {
+                entry.isLoading = false;
+            }
+        }
+        history.save();
     }
 
     hadError(msg) {

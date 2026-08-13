@@ -1420,6 +1420,9 @@ body.small-window > .tab-content.tab-hundred {
     flex: 0 0 2.75rem;
     width: 2.75rem;
 }
+.small-window .alt-skip {
+    flex: 0 0 auto;
+}
 .small-window #alt_interrupt_button {
     font-size: 1.5rem;
 }
@@ -1478,10 +1481,14 @@ body.small-window > .tab-content.tab-hundred {
     margin-left: 2px;
 }
 .simple-generate-button {
-    width: calc(100% - 40px);
+    width: calc(100% - 88px);
 }
 .alt-prompt-center-button {
     border-radius: 0 !important;
+}
+.alt-skip {
+    border-radius: 0 !important;
+    margin-left: 0;
 }
 .alt-interrupt {
     margin-left: 0px;

@@ -6,6 +6,9 @@ class GenerateHandler {
         this.totalGenRunTime = 0;
         this.validateModel = true;
         this.interrupted = -1;
+        this.generationIdsByBatch = {};
+        this.skipPending = false;
+        this.skipButtonId = 'alt_skip_button';
         this.sockets = {};
         this.imageContainerDivId = 'current_image';
         this.imageId = 'current_image_img';
@@ -50,6 +53,11 @@ class GenerateHandler {
         // nothing to do here
     }
 
+    /** Handles tab-specific cleanup after a generation is skipped. */
+    gotGenerationSkipped(skipped, img) {
+        // nothing to do here
+    }
+
     hadError(msg) {
         showError(msg);
     }
@@ -66,6 +74,45 @@ class GenerateHandler {
     doInterrupt(allSessions = false) {
         this.interrupted = this.batchesEver;
         doInterrupt(allSessions);
+    }
+
+    /** Skips the currently tracked generation. */
+    doSkip() {
+        if (this.skipPending) {
+            return;
+        }
+        this.skipPending = true;
+        let currentImage = document.getElementById(this.imageId);
+        let currentBatchId = currentImage?.dataset.batch_id;
+        let generationId = this.generationIdsByBatch[currentBatchId] ?? null;
+        this.updateSkipButton();
+        skipGeneration(generationId, data => {
+            if (data.skipped) {
+                this.removeGenerationId(data.generation_id);
+            }
+            else if (this.generationIdsByBatch[currentBatchId] == generationId) {
+                delete this.generationIdsByBatch[currentBatchId];
+            }
+            this.skipPending = false;
+            this.updateSkipButton();
+        });
+    }
+
+    /** Updates this tab's Skip button state. */
+    updateSkipButton() {
+        let button = document.getElementById(this.skipButtonId);
+        if (button) {
+            button.disabled = this.skipPending || (Object.keys(this.generationIdsByBatch).length == 0 && num_live_gens == 0);
+        }
+    }
+
+    /** Removes all batch mappings for one generation. */
+    removeGenerationId(generationId) {
+        for (let batchId of Object.keys(this.generationIdsByBatch)) {
+            if (`${this.generationIdsByBatch[batchId]}` == `${generationId}`) {
+                delete this.generationIdsByBatch[batchId];
+            }
+        }
     }
 
     doInterruptAndGen() {
@@ -158,6 +205,9 @@ class GenerateHandler {
                 }
                 playCompletionAudio();
             }
+            this.generationIdsByBatch = {};
+            this.skipPending = false;
+            this.updateSkipButton();
             return;
         }
         if (isPreview) {
@@ -166,7 +216,45 @@ class GenerateHandler {
             }
             return;
         }
+        if (data.generation_started) {
+            let started = data.generation_started;
+            this.generationIdsByBatch[`${started.request_id}_${started.batch_index}`] = started.generation_id;
+            this.updateSkipButton();
+            return;
+        }
+        if (data.generation_finished) {
+            let finished = data.generation_finished;
+            this.removeGenerationId(finished.generation_id);
+            this.updateSkipButton();
+            return;
+        }
+        if (data.generation_skipped) {
+            this.skipPending = false;
+            let skipped = data.generation_skipped;
+            let img = images[skipped.batch_index];
+            let div = img ? this.getDiv(img) : null;
+            if (div) {
+                if (getUserSetting('ui.removeinterruptedgens', false)) {
+                    div.remove();
+                }
+                else {
+                    let spinner = div.querySelector('.loading-spinner-parent');
+                    let progressBars = div.querySelector('.image-preview-progress-wrapper');
+                    spinner?.remove();
+                    progressBars?.remove();
+                    div.appendChild(createDiv(null, 'image-block-failed'));
+                    delete div.dataset.is_generating;
+                }
+            }
+            this.gotGenerationSkipped(skipped, img);
+            delete images[skipped.batch_index];
+            this.removeGenerationId(skipped.generation_id);
+            this.updateSkipButton();
+            return;
+        }
         if (data.image) {
+            this.removeGenerationId(data.generation_id);
+            this.updateSkipButton();
             let timeNow = Date.now();
             let timeDiff = timeNow - timeLastGenHit[0];
             timeLastGenHit[0] = timeNow;
@@ -229,6 +317,8 @@ class GenerateHandler {
         }
         if (data.gen_progress) {
             let thisBatchId = `${data.gen_progress.request_id}_${data.gen_progress.batch_index}`;
+            this.generationIdsByBatch[thisBatchId] = data.gen_progress.generation_id;
+            this.updateSkipButton();
             let metadataRaw = data.gen_progress.metadata ?? '{}';
             if (!(data.gen_progress.batch_index in images)) {
                 let metadataParsed = JSON.parse(metadataRaw);
@@ -322,6 +412,8 @@ class GenerateHandler {
             let socket = null;
             let handleError = e => {
                 console.log(`Error in GenerateText2ImageWS:`, e, this.interrupted, batch_id);
+                this.skipPending = false;
+                this.updateSkipButton();
                 setTimeout(() => {
                     for (let imgHolder of Object.values(images)) {
                         let div = this.getDiv(imgHolder);

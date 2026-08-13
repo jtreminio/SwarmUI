@@ -81,6 +81,8 @@ function updateCurrentStatusDirect(data) {
     }
     getRequiredElementById('alt_interrupt_button').classList.toggle('interrupt-button-none', total == 0);
     getRequiredElementById('simple_interrupt_button').classList.toggle('interrupt-button-none', total == 0);
+    mainGenHandler.updateSkipButton();
+    simpleTab.genHandler.updateSkipButton();
     let oldInterruptButton = document.getElementById('interrupt_button');
     if (oldInterruptButton) {
         oldInterruptButton.classList.toggle('interrupt-button-none', total == 0);
@@ -409,6 +411,7 @@ function updateAllModels(models) {
 function setTitles() {
     getRequiredElementById('alt_prompt_textbox').title = "Tell the AI what you want to see, then press Enter to submit.\nConsider 'a photo of a cat', or 'cartoonish drawing of an astronaut'";
     getRequiredElementById('alt_interrupt_button').title = "Interrupt current generation(s)\nRight-click for advanced options.";
+    getRequiredElementById('alt_skip_button').title = "Skip only the currently generating item and continue the queue.";
     getRequiredElementById('alt_generate_button').title = "Start generating images\nRight-click for advanced options.";
     let oldGenerateButton = document.getElementById('generate_button');
     if (oldGenerateButton) {

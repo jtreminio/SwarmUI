@@ -111,7 +111,16 @@ public abstract class AutoWebUIAPIAbstractBackend : AbstractT2IBackend
         {
             handler(toSend, user_input);
         }
-        JObject result = await SendPost<JObject>(route, toSend);
+        Task<JObject> generationTask = SendPost<JObject>(route, toSend);
+        using CancellationTokenRegistration interruptRegistration = user_input.InterruptToken.Register(() =>
+        {
+            _ = Utilities.RunCheckedTask(async () => await SendPost<JObject>("interrupt", new JObject()));
+        });
+        JObject result = await generationTask;
+        if (user_input.InterruptToken.IsCancellationRequested)
+        {
+            return [];
+        }
         // TODO: Error handlers
         return [.. result["images"].Select(i => ImageFile.FromBase64((string)i, MediaType.ImagePng) as Image)];
     }

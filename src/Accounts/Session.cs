@@ -64,6 +64,9 @@ public class Session : IEquatable<Session>
     /// <summary>All current generation claims.</summary>
     public ConcurrentDictionary<long, GenClaim> Claims = [];
 
+    /// <summary>All individually tracked generation tasks.</summary>
+    public ConcurrentDictionary<long, GenerationTask> GenerationTasks = [];
+
     /// <summary>Statistics about the generations currently waiting in this session.</summary>
     public int WaitingGenerations = 0, LoadingModels = 0, WaitingBackends = 0, LiveGens = 0;
 
@@ -152,6 +155,125 @@ public class Session : IEquatable<Session>
         ~GenClaim()
         {
             Dispose();
+        }
+    }
+
+    /// <summary>Tracks and interrupts one generation task without affecting sibling tasks.</summary>
+    public class GenerationTask : IDisposable
+    {
+        /// <summary>Current number used to generate <see cref="ID"/>.</summary>
+        public static long NextID = 0;
+
+        /// <summary>Unique generation task ID.</summary>
+        public long ID = Interlocked.Increment(ref NextID);
+
+        /// <summary>The session that owns this task.</summary>
+        public Session Sess;
+
+        /// <summary>The user request ID associated with this task.</summary>
+        public long RequestID;
+
+        /// <summary>The batch index associated with this task.</summary>
+        public string BatchIndex;
+
+        /// <summary>Optional ID supplied by a forwarding Swarm instance.</summary>
+        public string ClientGenerationID;
+
+        /// <summary>Token source that interrupts only this task.</summary>
+        public CancellationTokenSource LocalInterrupt = new();
+
+        /// <summary>Token source linked to session, claim, and task interruption.</summary>
+        public CancellationTokenSource LinkedInterrupt;
+
+        /// <summary>Lock for task state changes.</summary>
+        public LockObject StateLock = new();
+
+        /// <summary>Whether this task currently owns a backend generation slot.</summary>
+        public volatile bool IsLive = false;
+
+        /// <summary>Whether this task has announced that generation started.</summary>
+        public bool HasStarted = false;
+
+        /// <summary>Whether this task was explicitly skipped.</summary>
+        public volatile bool SkipRequested = false;
+
+        /// <summary>Whether this task has completed and been removed.</summary>
+        public bool IsComplete = false;
+
+        /// <summary>Combined cancellation token for this task.</summary>
+        public CancellationToken InterruptToken => LinkedInterrupt.Token;
+
+        public GenerationTask(Session session, GenClaim claim, long requestID, string batchIndex, string clientGenerationID)
+        {
+            Sess = session;
+            RequestID = requestID;
+            BatchIndex = batchIndex;
+            ClientGenerationID = clientGenerationID;
+            LinkedInterrupt = CancellationTokenSource.CreateLinkedTokenSource(claim.InterruptToken, claim.LocalClaimInterrupt.Token, LocalInterrupt.Token);
+            session.GenerationTasks[ID] = this;
+        }
+
+        /// <summary>Marks this task as actively generating on a backend.</summary>
+        public bool MarkLive()
+        {
+            lock (StateLock)
+            {
+                if (!IsComplete)
+                {
+                    IsLive = true;
+                    bool isFirst = !HasStarted;
+                    HasStarted = true;
+                    return isFirst;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>Attempts to skip this task if it is actively generating.</summary>
+        public bool TrySkip()
+        {
+            lock (StateLock)
+            {
+                if (IsComplete || !IsLive || SkipRequested || LinkedInterrupt.IsCancellationRequested)
+                {
+                    return false;
+                }
+                SkipRequested = true;
+                LocalInterrupt.Cancel();
+                return true;
+            }
+        }
+
+        /// <summary>Atomically prevents skips once a final output has started.</summary>
+        public bool TryBeginOutput()
+        {
+            lock (StateLock)
+            {
+                if (IsComplete || SkipRequested)
+                {
+                    return false;
+                }
+                IsLive = false;
+                return true;
+            }
+        }
+
+        /// <summary>Removes this task from active tracking.</summary>
+        public void Dispose()
+        {
+            lock (StateLock)
+            {
+                if (IsComplete)
+                {
+                    return;
+                }
+                IsComplete = true;
+                IsLive = false;
+            }
+            Sess.GenerationTasks.TryRemove(ID, out _);
+            LinkedInterrupt.Dispose();
+            LocalInterrupt.Dispose();
+            GC.SuppressFinalize(this);
         }
     }
 

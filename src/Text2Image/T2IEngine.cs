@@ -184,7 +184,7 @@ namespace SwarmUI.Text2Image
         }
 
         /// <summary>Internal handler route to create an image based on a user request.</summary>
-        public static async Task CreateImageTask(T2IParamInput user_input, string batchId, Session.GenClaim claim, Action<JObject> output, Action<string> setError, bool isWS, float backendTimeoutMin, Action<ImageOutput, string> saveImages, bool canCallTools)
+        public static async Task CreateImageTask(T2IParamInput user_input, string batchId, Session.GenClaim claim, Action<JObject> output, Action<string> setError, bool isWS, float backendTimeoutMin, Action<ImageOutput, string> saveImages, bool canCallTools, bool isRootTask = true)
         {
             long timeStart = Environment.TickCount64;
             void sendStatus()
@@ -194,16 +194,61 @@ namespace SwarmUI.Text2Image
                     output(BasicAPIFeatures.GetCurrentStatusRaw(user_input.SourceSession));
                 }
             }
-            if (claim.ShouldCancel)
+            if (claim.ShouldCancel || user_input.InterruptToken.IsCancellationRequested)
             {
                 return;
             }
             long prepTime = Environment.TickCount64;
             int numImagesGenned = 0;
+            bool skipReported = false;
+            bool finishReported = false;
             long lastGenTime = Environment.TickCount64;
             string genTimeReport = "? failed!";
+            void reportSkipped()
+            {
+                if (!isRootTask || skipReported || !(user_input.GenerationTask?.SkipRequested ?? false))
+                {
+                    return;
+                }
+                skipReported = true;
+                Logs.Info($"Skipped generation task #{user_input.GenerationTask.ID}.");
+                output(new JObject()
+                {
+                    ["generation_skipped"] = new JObject()
+                    {
+                        ["generation_id"] = $"{user_input.GenerationTask.ID}",
+                        ["request_id"] = $"{user_input.UserRequestId}",
+                        ["batch_index"] = user_input.GenerationTask.BatchIndex
+                    }
+                });
+            }
+            void reportFinished()
+            {
+                if (!isRootTask || finishReported || !(user_input.GenerationTask?.HasStarted ?? false))
+                {
+                    return;
+                }
+                finishReported = true;
+                output(new JObject()
+                {
+                    ["generation_finished"] = new JObject()
+                    {
+                        ["generation_id"] = $"{user_input.GenerationTask.ID}",
+                        ["request_id"] = $"{user_input.UserRequestId}",
+                        ["batch_index"] = user_input.GenerationTask.BatchIndex
+                    }
+                });
+            }
             void handleFileOutput(ImageOutput img)
             {
+                if (isRootTask && img.IsReal && user_input.GenerationTask is not null && !user_input.GenerationTask.TryBeginOutput())
+                {
+                    return;
+                }
+                if (user_input.InterruptToken.IsCancellationRequested)
+                {
+                    return;
+                }
                 lastGenTime = Environment.TickCount64;
                 if (img.GenTimeMS < 0)
                 {
@@ -251,6 +296,7 @@ namespace SwarmUI.Text2Image
                         if (cleanup == 0)
                         {
                             handleFileOutput(new() { File = multiImg, IsReal = true, GenTimeMS = -1, RefuseImage = null });
+                            reportFinished();
                             return;
                         }
                         user_input.Set(T2IParamTypes.InitImageCreativity, cleanup);
@@ -270,7 +316,7 @@ namespace SwarmUI.Text2Image
                 claim.Extend(backendWaits: 1);
                 sendStatus();
                 backend = await Program.Backends.GetNextT2IBackend(TimeSpan.FromMinutes(backendTimeoutMin), user_input.Get(T2IParamTypes.Model), user_input,
-                    filter: BackendMatcherFor(user_input), session: user_input.SourceSession, notifyWillLoad: sendStatus, cancel: claim.InterruptToken);
+                    filter: BackendMatcherFor(user_input), session: user_input.SourceSession, notifyWillLoad: sendStatus, cancel: user_input.InterruptToken);
             }
             catch (SwarmReadableErrorException ex)
             {
@@ -287,18 +333,33 @@ namespace SwarmUI.Text2Image
                 claim.Complete(backendWaits: 1);
                 sendStatus();
             }
-            if (claim.ShouldCancel)
+            if (claim.ShouldCancel || user_input.InterruptToken.IsCancellationRequested)
             {
                 backend?.Dispose();
+                reportSkipped();
+                reportFinished();
                 return;
             }
             try
             {
+                bool generationStarted = user_input.GenerationTask?.MarkLive() ?? false;
+                if (generationStarted)
+                {
+                    output(new JObject()
+                    {
+                        ["generation_started"] = new JObject()
+                        {
+                            ["generation_id"] = $"{user_input.GenerationTask.ID}",
+                            ["request_id"] = $"{user_input.UserRequestId}",
+                            ["batch_index"] = user_input.GenerationTask.BatchIndex
+                        }
+                    });
+                }
                 claim.Extend(liveGens: 1);
                 sendStatus();
                 using (backend)
                 {
-                    if (claim.ShouldCancel)
+                    if (claim.ShouldCancel || user_input.InterruptToken.IsCancellationRequested)
                     {
                         return;
                     }
@@ -315,10 +376,16 @@ namespace SwarmUI.Text2Image
                         }
                         else
                         {
-                            output(new JObject() { ["gen_progress"] = (JToken)obj });
+                            JToken progress = (JToken)obj;
+                            if (progress is JObject progressObject && user_input.GenerationTask is not null)
+                            {
+                                progressObject["generation_id"] = $"{user_input.GenerationTask.ID}";
+                            }
+                            output(new JObject() { ["gen_progress"] = progress });
                         }
                     });
-                    if (numImagesGenned == 0)
+                    reportSkipped();
+                    if (numImagesGenned == 0 && !skipReported && !(user_input.GenerationTask?.SkipRequested ?? false))
                     {
                         if (claim.ShouldCancel)
                         {
@@ -352,10 +419,15 @@ namespace SwarmUI.Text2Image
                         ex = e2;
                     }
                 }
+                if (user_input.GenerationTask?.SkipRequested ?? false)
+                {
+                    reportSkipped();
+                    return;
+                }
                 if (ex is AbstractBackend.PleaseRedirectException)
                 {
                     claim.Extend(gens: 1);
-                    await CreateImageTask(user_input, batchId, claim, output, setError, isWS, backendTimeoutMin, saveImages, false);
+                    await CreateImageTask(user_input, batchId, claim, output, setError, isWS, backendTimeoutMin, saveImages, false, isRootTask);
                 }
                 else if (ex is SwarmReadableErrorException)
                 {
@@ -369,6 +441,7 @@ namespace SwarmUI.Text2Image
                 }
                 else if (ex is TaskCanceledException)
                 {
+                    reportSkipped();
                     return;
                 }
                 else
@@ -380,6 +453,8 @@ namespace SwarmUI.Text2Image
             }
             finally
             {
+                reportSkipped();
+                reportFinished();
                 claim.Complete(gens: 1, liveGens: 1);
                 sendStatus();
             }
